@@ -39,7 +39,7 @@ require_once dirname(__FILE__) . '/PhpType.php';
  * @package Phpmodbus  
  *
  */
-class ModbusMaster {
+class ModbusMaster__construct() {
   private $sock;
   public $host = "192.168.1.1";
   public $port = "502";  
