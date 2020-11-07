@@ -41,8 +41,8 @@ class Pluggit extends IPSModule
         $this->RegisterPropertyInteger("ResetFanSpeedLevel", 1);
         $this->RegisterPropertyInteger("AlarmArchive", 1);
 
-        $this->RegisterTimer("Poller", 0, "PLUGGIT_Update(\$_IPS['TARGET']);");
-        $this->RegisterTimer("ResetFanSpeedLevel", 0, "PLUGGIT_SetFanSpeedLevel(\$_IPS['TARGET'], 3);");
+        $this->RegisterTimer("Poller", 0, "PLUG_Update(\$_IPS['TARGET']);");
+        $this->RegisterTimer("ResetFanSpeedLevel", 0, "PLUG_SetFanSpeedLevel(\$_IPS['TARGET'], 3);");
     }
     
     public function ApplyChanges()
@@ -543,7 +543,7 @@ class Pluggit extends IPSModule
         return $output;
     }
 
-    public function SetFanSpeedLevel($value) {
+    public function SetFanSpeedLevel(?int $value) {
         $this->SetTimerInterval("ResetFanSpeedLevel", 0);
 
         if($value >= 0 && $value <= 4) {
@@ -628,7 +628,7 @@ class Pluggit extends IPSModule
         return $output;
     }
 
-    public function SetBypassState($value) {
+    public function SetBypassState(?int $value) {
         if($value == 128 || $value == 32896) {
             $this->SetOperatingState($value);
         }
@@ -649,7 +649,7 @@ class Pluggit extends IPSModule
         return $output;
     }
 
-    public function SetOperatingState($value) {
+    public function SetOperatingState(?int $value) {
         $address = 40169;
 
         switch ($value) {
