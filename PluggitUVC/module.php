@@ -1,9 +1,13 @@
-<?
+<?php
 
 require_once(__dir__.'/../libs/Phpmodbus/ModbusMaster.php');
 
+require_once __DIR__.'/ContinuousFour.php';
+
 class Pluggit extends IPSModule
 {
+    use PluggitContinuousFour;
+    private $pollDeadline = null;
     var $Modbus_Properties = array(
         array("name" => "Seriennummer",                         "ident" => "prmSystemSerialNum",            "varType" => 3,     "varProfile" => null,                           "varHasAction" => false),
         array("name" => "Firmware Version",                     "ident" => "prmFWVersion",                  "varType" => 3,     "varProfile" => null,                           "varHasAction" => false),
@@ -33,6 +37,7 @@ class Pluggit extends IPSModule
     public function Create()
     {
         parent::Create();
+        $this->CreateContinuousFour();
 
         $this->CreateVariableProfiles();
 
@@ -48,6 +53,7 @@ class Pluggit extends IPSModule
     public function ApplyChanges()
     {
         parent::ApplyChanges();
+        $this->ApplyContinuousFour();
 
         // Get Handler for Archive
         $instances = IPS_GetInstanceListByModuleID('{43192F0B-135B-4CE7-A0A7-1475603F3060}'); 
@@ -99,6 +105,7 @@ class Pluggit extends IPSModule
 
     public function RequestAction($Ident, $Value) 
     { 
+        if ($Ident === 'ContinuousFour') { $this->SetContinuousFour((bool)$Value); return; }
         switch ($Ident) 
         { 
             case 'prmFilterRemainingTime':
@@ -123,6 +130,20 @@ class Pluggit extends IPSModule
     }
 
     public function Update() {
+        $lock = 'PLUG_POLL_' . $this->InstanceID;
+        if (!IPS_SemaphoreEnter($lock, 0)) return;
+        $this->pollDeadline = microtime(true) + 20;
+        try {
+            $this->UpdateValues();
+        } catch (\Throwable $e) {
+            $this->SendDebug('Poller', 'Abfrage abgebrochen: '.$e->getMessage(), 0);
+        } finally {
+            $this->pollDeadline = null;
+            IPS_SemaphoreLeave($lock);
+        }
+    }
+
+    private function UpdateValues() {
         foreach($this->Modbus_Properties as $property) {
             $var = @IPS_GetObjectIDByIdent($property['ident'], $this->InstanceID);
             
@@ -544,6 +565,7 @@ class Pluggit extends IPSModule
     }
 
     public function SetFanSpeedLevel(?int $value) {
+        if ($this->GetValue("ContinuousFour") && $value !== 4) return;
         $this->SetTimerInterval("ResetFanSpeedLevel", 0);
 
         if($value >= 0 && $value <= 4) {
@@ -555,7 +577,7 @@ class Pluggit extends IPSModule
             $dataTypes = array("DINT");
             $this->SendWriteRequest(($address-40001), $data, $dataTypes);
 
-            if($value == 0 || $value == 4) {
+            if(($value == 0 || $value == 4) && !$this->GetValue("ContinuousFour")) {
                 $this->SetTimerInterval("ResetFanSpeedLevel", $this->ReadPropertyInteger("ResetFanSpeedLevel")*3600000);
             }
         }
@@ -792,36 +814,31 @@ class Pluggit extends IPSModule
     }
 
 
+    private function ModbusRequest($write, $address, $lengthOrData, $dataTypes = null) {
+        $ip = trim($this->ReadPropertyString('IP'));
+        if ($ip === '') throw new \RuntimeException('Pluggit IP fehlt');
+        $timeout = $this->pollDeadline === null ? 3.0 : min(3.0, $this->pollDeadline-microtime(true));
+        if ($timeout <= 0) throw new \RuntimeException('Pluggit Poller-Zeitlimit erreicht');
+        $lock = 'PLUG_IO_' . $this->InstanceID;
+        if (!IPS_SemaphoreEnter($lock, 0)) throw new \RuntimeException('Pluggit Abfrage bereits aktiv');
+        $modbus = null;
+        try {
+            $modbus = new ModbusMaster($ip, 'TCP');
+            $modbus->timeout_sec = $timeout;
+            return $write ? $modbus->writeMultipleRegister(1,$address,$lengthOrData,$dataTypes)
+                          : $modbus->readMultipleRegisters(1,$address,$lengthOrData);
+        } finally {
+            unset($modbus);
+            IPS_SemaphoreLeave($lock);
+        }
+    }
+
     protected function SendReadRequest($address, $length) {
-        $return = false;
-
-        if(strlen(trim($this->ReadPropertyString("IP"))) > 0) {
-            $modbus = new ModbusMaster($this->ReadPropertyString("IP"), "TCP");            
-
-            try {
-                $return = $modbus->readMultipleRegisters(1, $address, $length);
-            } catch (Exception $e) {
-                // $this->ModuleLogMessage("Modbus fehler: ".$e);
-            }
-        }  
-
-        return $return;
+        return $this->ModbusRequest(false, $address, $length);
     }
 
     protected function SendWriteRequest($address, $data, $dataTypes) {
-        $return = false;
-
-        if(strlen(trim($this->ReadPropertyString("IP"))) > 0) {
-            $modbus = new ModbusMaster($this->ReadPropertyString("IP"), "TCP");            
-
-            try {
-                $return = $modbus->writeMultipleRegister(1, $address, $data, $dataTypes);
-            } catch (Exception $e) {
-                // $this->ModuleLogMessage("Modbus fehler: ".$e);
-            }
-        }  
-
-        return $return;
+        return $this->ModbusRequest(true, $address, $data, $dataTypes);
     }
 
     // HELPER FUNCTIONS

@@ -41,6 +41,7 @@ require_once dirname(__FILE__) . '/PhpType.php';
  */
 class ModbusMaster {
   private $sock;
+  private $deadline = 0.0;
   public $host = "192.168.1.1";
   public $port = "502";  
   public $client = "";
@@ -79,99 +80,73 @@ class ModbusMaster {
    *
    * @return bool
    */
+  // Blocking streams avoid the FD_SETSIZE limit of socket_select in long-running Symcon.
+  // A single deadline bounds connect, send and receive.
+  private function streamTimeout(){
+    $left = $this->deadline - microtime(true);
+    if ($left <= 0) throw new Exception("Modbus deadline exceeded");
+    $sec = (int)$left;
+    stream_set_timeout($this->sock, $sec, max(1, (int)(($left-$sec)*1000000)));
+  }
+
   private function connect(){
-    // Create a protocol specific socket 
-    if ($this->socket_protocol == "TCP"){ 
-        // TCP socket
-        $this->sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);      
-    } elseif ($this->socket_protocol == "UDP"){
-        // UDP socket
-        $this->sock = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
-    } else {
-        throw new Exception("Unknown socket protocol, should be 'TCP' or 'UDP'");
-    }
-    // Bind the client socket to a specific local port
-    if (strlen($this->client)>0){
-        $result = socket_bind($this->sock, $this->client, $this->client_port);
-        if ($result === false) {
-            throw new Exception("socket_bind() failed.</br>Reason: ($result)".
-                socket_strerror(socket_last_error($this->sock)));
-        } else {
-            $this->status .= "Bound\n";
-        }
-    }
-    // Socket settings
-    socket_set_option($this->sock, SOL_SOCKET, SO_SNDTIMEO, array('sec' => 1, 'usec' => 0));
-    // Connect the socket
-    $result = @socket_connect($this->sock, $this->host, $this->port);
-    if ($result === false) {
-        throw new Exception("socket_connect() failed.</br>Reason: ($result)".
-            socket_strerror(socket_last_error($this->sock)));
-    } else {
-        $this->status .= "Connected\n";
-        return true;        
-    }    
+    $this->disconnect();
+    $timeout = max(0.01, (float)$this->timeout_sec);
+    $this->deadline = microtime(true) + $timeout;
+    if (!in_array($this->socket_protocol, ['TCP','UDP'], true)) throw new Exception("Unknown socket protocol");
+    $options = [];
+    if (strlen($this->client)>0) $options['socket']=['bindto'=>$this->client.':'.(int)$this->client_port];
+    $context = stream_context_create($options);
+    $errno=0; $error='';
+    $uri = strtolower($this->socket_protocol).'://'.$this->host.':'.(int)$this->port;
+    $this->sock = @stream_socket_client($uri, $errno, $error, $timeout, STREAM_CLIENT_CONNECT, $context);
+    if ($this->sock === false) throw new Exception("Modbus connect failed: ".$error.' ('.$errno.')');
+    stream_set_blocking($this->sock, true);
+    $this->streamTimeout();
+    return true;
   }
 
-  /**
-   * disconnect
-   *
-   * Disconnect the socket
-   */
-  private function disconnect(){    
-    socket_close($this->sock);
-    $this->status .= "Disconnected\n";
+  private function disconnect(){
+    if (is_resource($this->sock)) fclose($this->sock);
+    $this->sock = null;
   }
 
-  /**
-   * send
-   *
-   * Send the packet via Modbus
-   *
-   * @param string $packet
-   */
+  public function __destruct(){ $this->disconnect(); }
+
   private function send($packet){
-    socket_write($this->sock, $packet, strlen($packet));  
-    $this->status .= "Send\n";
+    $offset=0;
+    while ($offset<strlen($packet)) {
+      $this->streamTimeout();
+      $n=@fwrite($this->sock,substr($packet,$offset));
+      if ($n === false || $n === 0) {
+        $meta=stream_get_meta_data($this->sock);
+        throw new Exception(!empty($meta['timed_out']) ? "Modbus deadline exceeded" : "Modbus send failed");
+      }
+      $offset += $n;
+    }
   }
 
-  /**
-   * rec
-   *
-   * Receive data from the socket
-   *
-   * @return bool
-   */
   private function rec(){
-    socket_set_nonblock($this->sock);
-    $readsocks[] = $this->sock;     
-    $writesocks = NULL;
-    $exceptsocks = NULL;
-    $rec = "";
-    $lastAccess = time();
-    while (socket_select($readsocks, 
-            $writesocks, 
-            $exceptsocks,
-            0, 
-            300000) !== FALSE) {
-            $this->status .= "Wait data ... \n";
-        if (in_array($this->sock, $readsocks)) {
-            while (@socket_recv($this->sock, $rec, 2000, 0)) {
-                $this->status .= "Data received\n";
-                return $rec;
-            }
-            $lastAccess = time();
-        } else {             
-            if (time()-$lastAccess >= $this->timeout_sec) {
-                throw new Exception( "Watchdog time expired [ " .
-                  $this->timeout_sec . " sec]!!! Connection to " . 
-                  $this->host . " is not established.");
-            }
-        }
-        $readsocks[] = $this->sock;
+    $buffer=''; $expected=null;
+    while (true) {
+      $this->streamTimeout();
+      $length=$this->socket_protocol === 'UDP' ? 260 : ($expected===null ? 6-strlen($buffer) : $expected-strlen($buffer));
+      $chunk=@fread($this->sock,$length);
+      $meta=stream_get_meta_data($this->sock);
+      if (!empty($meta['timed_out'])) throw new Exception("Modbus deadline exceeded");
+      if ($chunk === false) throw new Exception("Modbus receive failed");
+      if ($chunk === '') throw new Exception("Modbus peer closed connection");
+      $buffer.=$chunk;
+      if ($this->socket_protocol === 'UDP') return $buffer;
+      if (strlen($buffer)>=6 && $expected===null) {
+        $h=unpack('ntransaction/nprotocol/nlength',substr($buffer,0,6));
+        if ($h['protocol']!==0 || $h['length']<2 || $h['length']>254) throw new Exception("Invalid Modbus TCP header");
+        $expected=6+$h['length'];
+      }
+      if ($expected!==null && strlen($buffer)>=$expected) return $buffer;
     }
-  } 
-  
+  }
+
   /**
    * responseCode
    *
